@@ -39,6 +39,131 @@ __all__ = [
     "RadFriendsSampler", "SupFriendsSampler"
 ]
 
+
+class InnerSampler:
+
+    def __init__(self):
+        pass
+
+    def set_logl(self, logl):
+        self.logl = logl
+
+    def set_prior_transf(self, transf):
+        self.prior_transf = transf
+
+    def set_ndim(self, ndim):
+        self.ndim = ndim
+
+    def set_nonbounded(self, nb):
+        self.nonbounded = nb
+
+    def new_point(self, logl_value, points, bounds=None):
+        pass
+
+    def tune(self):
+        pass
+
+
+def rescale_slice(self, nexpand, ncontract):
+    """Update the slice proposal scale based on the relative
+    size of the slices compared to our initial guess.
+    For slice sampling the scale is only 'advisory' in the sense that
+    the right scale will just speed up sampling as we'll have to expand
+    or contract less. It won't affect the quality of the samples much.
+    """
+    # see https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4063214/
+    # also 2002.06212
+    # https://www.tandfonline.com/doi/full/10.1080/10618600.2013.791193
+    # and https://github.com/joshspeagle/dynesty/issues/260
+    mult = (nexpand * 2. / (nexpand + ncontract))
+    # avoid drastic updates to the scale factor limiting to factor
+    # of two
+    mult = np.clip(mult, 0.5, 2)
+    # Remember I can't apply the rule that scale < cube diagonal
+    # because scale is multiplied by axes
+    return mult
+
+
+def rescale_walk(accept, reject, facc_target, ndim):
+    """Update the random walk proposal scale based on the current
+    number of accepted/rejected steps.
+    For rwalk the scale is important because it
+    determines the speed of diffusion of points.
+    I.e. if scale is too large, the proposal efficiency will be very low
+    so it's likely that we'll only do one random walk step at the time,
+    thus producing very correlated chain.
+    """
+    facc = (1. * accept) / (accept + reject)
+    # Here we are now trying to solve the Eqn
+    # f0 = F(s) where F is the function
+    # providing the acceptance rate given logscale
+    # and f0 is our target acceptance rate
+    # in this case a Newton like updea to s
+    # is s_{k+1} = s_k - 1/F'(s_k) * (F_k - F_0)
+    # We can speculate that F(s)~ C*exp(-Ns)
+    # i.e. it's inversely proportional to volume
+    # Then F'(s) = -N * F \approx N * F_0
+    # Therefore s_{k+1} = s_k + 1/(N*F_0) * (F_k-F0)
+    # See also Robbins-Munro recursion which we don't follow
+    # here because our coefficients a_k do not obey \sum a_k^2 = \infty
+    return math.exp((facc - facc_target) / ndim / facc_target)
+
+
+def rescale_hslice(self, nmove, nreflect, ncontract):
+    """Update the Hamiltonian slice proposal scale based
+        on the relative amount of time spent moving vs reflecting."""
+
+    fmove = (1. * nmove) / (nmove + nreflect + ncontract + 2)
+    norm = max(self.fmove, 1. - self.fmove)
+    return math.exp((fmove - self.fmove) / norm)
+
+
+class RSliceSampler(InnerSampler):
+
+    def __init__(self, walks=None):
+        self.walks = walks
+        self.nexpand = 0
+        self.ncontract = 0
+
+    def new_point(self, logl_value, points=None, bounds=None):
+        i = np.random.randint(len(points))
+        return sample_rslice(points[i])
+
+    def tune(self):
+        self.scale *= rescale_slice(self.nexpand, self.sncontract)
+
+
+class HSliceSampler(InnerSampler):
+
+    def __init__(self, walks=None):
+        self.walks = walks
+        self.nexpand = 0
+        self.ncontract = 0
+
+    def new_point(self, logl_value, points=None, bounds=None):
+        i = np.random.randint(len(points))
+        return sample_hslice(points[i])
+
+    def tune(self):
+        self.scale *= rescale_hslice(self.nexpand, self.sncontract)
+
+
+class RWalkSampler(InnerSampler):
+
+    def __init__(self, walks=None, facc=0.5):
+        # Initialize random walk parameters.
+        self.walks = max(2, walks or 25)
+        self.facc_target = min(1., max(1. / self.walks, self.facc))
+
+    def new_point(self, logl_value, points=None, bounds=None):
+        i = np.random.randint(len(points))
+        return sample_rwalk(points[i])
+
+    def tune(self):
+        self.scale *= rescale_walk(self.accept, self.reject, self.facc_target,
+                                   self.ndim)
+
+
 _SAMPLING = {
     'unif': sample_unif,
     'rwalk': sample_rwalk,
@@ -80,35 +205,8 @@ class SuperSampler(Sampler):
                          pool,
                          use_pool,
                          ncdim=ncdim)
-        # Initialize method to propose a new starting point.
-        self._PROPOSE = {
-            'unif': self.propose_unif,
-            'rwalk': self.propose_live,
-            'slice': self.propose_live,
-            'rslice': self.propose_live,
-            'hslice': self.propose_live,
-            'user-defined': self.propose_live
-        }
 
-        if callable(method):
-            _SAMPLING["user-defined"] = method
-            method = "user-defined"
-        self.propose_point = self._PROPOSE[method]
-
-        # Initialize method to "evolve" a point to a new position.
-        self.sampling, self.evolve_point = method, _SAMPLING[method]
-
-        # Initialize heuristic used to update our sampling method.
-        self._UPDATE = {
-            'unif': self.update_unif,
-            'rwalk': self.update_rwalk,
-            'slice': self.update_slice,
-            'rslice': self.update_slice,
-            'hslice': self.update_hslice,
-            'user-defined': self.update_user
-        }
-        # Initialize other arguments.
-        self.scale = 1.
+        self.sampling = method
 
         self.kwargs = kwargs or {}
         # please use self.kwargs below
@@ -127,11 +225,6 @@ class SuperSampler(Sampler):
         self.grad = self.kwargs.get('grad', None)
         self.compute_jac = self.kwargs.get('compute_jac', False)
 
-        # Initialize random walk parameters.
-        self.walks = max(2, self.kwargs.get('walks', 25))
-        self.facc = self.kwargs.get('facc', 0.5)
-        self.facc = min(1., max(1. / self.walks, self.facc))
-
         # Initialize slice parameters.
         self.slices = self.kwargs.get('slices', 5)
         self.fmove = self.kwargs.get('fmove', 0.9)
@@ -142,72 +235,6 @@ class SuperSampler(Sampler):
 
     def propose_live(self, *args):
         pass
-
-    def update_unif(self, blob):
-        """Filler function."""
-        pass
-
-    def update_rwalk(self, blob):
-        """Update the random walk proposal scale based on the current
-        number of accepted/rejected steps.
-        For rwalk the scale is important because it
-        determines the speed of diffusion of points.
-        I.e. if scale is too large, the proposal efficiency will be very low
-        so it's likely that we'll only do one random walk step at the time,
-        thus producing very correlated chain.
-        """
-        self.scale = blob['scale']
-        accept, reject = blob['accept'], blob['reject']
-        facc = (1. * accept) / (accept + reject)
-        # Here we are now trying to solve the Eqn
-        # f0 = F(s) where F is the function
-        # providing the acceptance rate given logscale
-        # and f0 is our target acceptance rate
-        # in this case a Newton like update to s
-        # is s_{k+1} = s_k - 1/F'(s_k) * (F_k - F_0)
-        # We can speculate that F(s)~ C*exp(-Ns)
-        # i.e. it's inversely proportional to volume
-        # Then F'(s) = -N * F \approx N * F_0
-        # Therefore s_{k+1} = s_k + 1/(N*F_0) * (F_k-F0)
-        # See also Robbins-Munro recursion which we don't follow
-        # here because our coefficients a_k do not obey \sum a_k^2 = \infty
-        self.scale *= math.exp((facc - self.facc) / self.ncdim / self.facc)
-
-    def update_slice(self, blob):
-        """Update the slice proposal scale based on the relative
-        size of the slices compared to our initial guess.
-        For slice sampling the scale is only 'advisory' in the sense that
-        the right scale will just speed up sampling as we'll have to expand
-        or contract less. It won't affect the quality of the samples much.
-        """
-        # see https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4063214/
-        # also 2002.06212
-        # https://www.tandfonline.com/doi/full/10.1080/10618600.2013.791193
-        # and https://github.com/joshspeagle/dynesty/issues/260
-        nexpand, ncontract = max(blob['nexpand'], 1), blob['ncontract']
-        mult = (nexpand * 2. / (nexpand + ncontract))
-        # avoid drastic updates to the scale factor limiting to factor
-        # of two
-        mult = np.clip(mult, 0.5, 2)
-        # Remember I can't apply the rule that scale < cube diagonal
-        # because scale is multiplied by axes
-        self.scale = self.scale * mult
-
-    def update_hslice(self, blob):
-        """Update the Hamiltonian slice proposal scale based
-        on the relative amount of time spent moving vs reflecting."""
-
-        nmove, nreflect = blob['nmove'], blob['nreflect']
-        ncontract = blob.get('ncontract', 0)
-        fmove = (1. * nmove) / (nmove + nreflect + ncontract + 2)
-        norm = max(self.fmove, 1. - self.fmove)
-        self.scale *= math.exp((fmove - self.fmove) / norm)
-
-    def update_user(self, blob):
-        """Update the scale based on the user-defined update function."""
-
-        if callable(self.custom_update):
-            self.scale = self.custom_update(blob, self.scale)
 
 
 class UnitCubeSampler(SuperSampler):
